@@ -10,11 +10,17 @@ use std::{
 
 use bytes::Bytes;
 use futures_core::Stream;
+#[cfg(feature = "backpressure_request_debug")]
+use tracing::log;
 
 use crate::error::PayloadError;
 
 /// max buffer size 32k
 pub(crate) const MAX_BUFFER_SIZE: usize = 32_768;
+
+#[cfg(feature = "backpressure_request")]
+/// max data held in items queue (_at least_ one Bytes!)
+pub(crate) const MAX_DATA_INFLIGHT: usize = 1024 * 1024;
 
 #[derive(Debug, PartialEq)]
 pub enum PayloadStatus {
@@ -110,6 +116,15 @@ impl PayloadSender {
         }
     }
 
+    #[cfg(feature = "backpressure_request")]
+    #[inline]
+    pub fn feed_data(&mut self, data: Bytes) -> Option<Bytes> {
+        if let Some(shared) = self.inner.upgrade() {
+            return shared.borrow_mut().feed_data(data);
+        }
+        None
+    }
+    #[cfg(not(feature = "backpressure_request"))]
     #[inline]
     pub fn feed_data(&mut self, data: Bytes) {
         if let Some(shared) = self.inner.upgrade() {
@@ -143,6 +158,8 @@ struct Inner {
     items: VecDeque<Bytes>,
     task: Option<Waker>,
     io_task: Option<Waker>,
+    #[cfg(feature = "backpressure_request_debug")]
+    max_len_items: usize,
 }
 
 impl Inner {
@@ -155,6 +172,8 @@ impl Inner {
             need_read: true,
             task: None,
             io_task: None,
+            #[cfg(feature = "backpressure_request_debug")]
+            max_len_items: 0,
         }
     }
 
@@ -204,8 +223,36 @@ impl Inner {
     #[inline]
     fn feed_eof(&mut self) {
         self.eof = true;
+        #[cfg(feature = "backpressure_request_debug")]
+        {
+            log::debug!(
+                "payload getting EOF, max_len_items: {} byte",
+                self.max_len_items
+            );
+        }
     }
 
+    #[cfg(feature = "backpressure_request")]
+    #[inline]
+    fn feed_data(&mut self, data: Bytes) -> Option<Bytes> {
+        let len_inflight: usize = self.items.iter().map(|item| item.len()).sum();
+        if len_inflight >= MAX_DATA_INFLIGHT {
+            // eprintln!("exerting backpressure...");
+            return Some(data);
+        }
+        #[cfg(feature = "backpressure_request_debug")]
+        {
+            // since at this point we know we'll add `data` to the queue...
+            let len_inflight = len_inflight + data.len();
+            self.max_len_items = std::cmp::max(len_inflight, self.max_len_items);
+        }
+        self.len += data.len();
+        self.items.push_back(data);
+        self.need_read = self.len < MAX_BUFFER_SIZE;
+        self.wake();
+        None
+    }
+    #[cfg(not(feature = "backpressure_request"))]
     #[inline]
     fn feed_data(&mut self, data: Bytes) {
         self.len += data.len();

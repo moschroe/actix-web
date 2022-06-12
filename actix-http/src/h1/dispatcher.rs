@@ -12,10 +12,12 @@ use actix_codec::{AsyncRead, AsyncWrite, Decoder as _, Encoder as _, Framed, Fra
 use actix_rt::time::sleep_until;
 use actix_service::Service;
 use bitflags::bitflags;
+#[cfg(feature = "backpressure_request")]
+use bytes::Bytes;
 use bytes::{Buf, BytesMut};
 use futures_core::ready;
 use pin_project_lite::pin_project;
-use tracing::{error, trace};
+use tracing::{error, log, trace};
 
 use crate::{
     body::{BodySize, BoxBody, MessageBody},
@@ -129,6 +131,17 @@ pin_project! {
     }
 }
 
+/// Container for optional fields as pin_project does not support `#[cfg]` attributes, see also
+/// https://github.com/taiki-e/pin-project-lite/issues/3#issuecomment-758323290
+#[cfg(feature = "backpressure_request")]
+#[derive(Default)]
+struct BackPressureItems {
+    opt_queued_chunk: Option<Bytes>,
+}
+/// When feature is not enabled, make it a zero-size type alias
+#[cfg(not(feature = "backpressure_request"))]
+type BackPressureItems = ();
+
 pin_project! {
     #[project = InnerDispatcherProj]
     pub(super) struct InnerDispatcher<T, S, B, X, U>
@@ -156,6 +169,7 @@ pin_project! {
         // when Some(_) dispatcher is in state of receiving request payload
         payload: Option<PayloadSender>,
         messages: VecDeque<DispatcherMessage>,
+        backpressure_items: BackPressureItems,
 
         head_timer: TimerState,
         ka_timer: TimerState,
@@ -257,6 +271,14 @@ where
         peer_addr: Option<net::SocketAddr>,
         conn_data: OnConnectData,
     ) -> Self {
+        #[cfg(feature = "backpressure_request")]
+        {
+            log::debug!("backpressure enabled for dispatcher");
+        }
+        #[cfg(not(feature = "backpressure_request"))]
+        {
+            log::debug!("no backpressure handling in dispatcher");
+        }
         Dispatcher {
             inner: DispatcherState::Normal {
                 inner: InnerDispatcher {
@@ -270,6 +292,7 @@ where
                     state: State::None,
                     payload: None,
                     messages: VecDeque::new(),
+                    backpressure_items: Default::default(),
 
                     head_timer: TimerState::new(config.client_request_deadline().is_some()),
                     ka_timer: TimerState::new(config.keep_alive().enabled()),
@@ -698,9 +721,34 @@ where
         let mut this = self.as_mut().project();
 
         let mut updated = false;
+        #[cfg(feature = "backpressure_request")]
+        let mut updated_before_backpressure = false;
 
         // decode from read buf as many full requests as possible
         loop {
+            #[cfg(feature = "backpressure_request")]
+            {
+                // are we experiencing backpressure?
+                if let Some(inflight) = this.backpressure_items.opt_queued_chunk.take() {
+                    // attempt delivery
+                    if let Some(ref mut payload) = this.payload {
+                        if let Some(rejected) = payload.feed_data(inflight) {
+                            // we _still_ have backpressure, queue chunk and exit loop
+                            let _ = this.backpressure_items.opt_queued_chunk.insert(rejected);
+                            break;
+                        }
+                    } else {
+                        log::error!("Internal server error: unexpected payload chunk");
+                        this.flags.insert(Flags::READ_DISCONNECT);
+                        this.messages.push_back(DispatcherMessage::Error(
+                            Response::internal_server_error().drop_body(),
+                        ));
+                        *this.error = Some(DispatchError::InternalError);
+                        break;
+                    }
+                }
+            }
+
             match this.codec.decode(this.read_buf) {
                 Ok(Some(msg)) => {
                     updated = true;
@@ -750,7 +798,26 @@ where
 
                         Message::Chunk(Some(chunk)) => {
                             if let Some(ref mut payload) = this.payload {
-                                payload.feed_data(chunk);
+                                #[cfg(feature = "backpressure_request")]
+                                {
+                                    if let Some(rejected) = payload.feed_data(chunk) {
+                                        // we have backpressure, queue chunk and exit loop
+                                        assert_eq!(
+                                            this.backpressure_items
+                                                .opt_queued_chunk
+                                                .replace(rejected),
+                                            None,
+                                            "read new chunk from stream when there still \
+                                        was an undelivered chunk stuck in the queue!"
+                                        );
+                                    } else {
+                                        updated_before_backpressure = true;
+                                    }
+                                }
+                                #[cfg(not(feature = "backpressure_request"))]
+                                {
+                                    payload.feed_data(chunk);
+                                }
                             } else {
                                 error!("Internal server error: unexpected payload chunk");
                                 this.flags.insert(Flags::READ_DISCONNECT);
@@ -827,6 +894,11 @@ where
                     break;
                 }
             }
+        }
+
+        #[cfg(feature = "backpressure_request")]
+        {
+            updated = updated && updated_before_backpressure;
         }
 
         Ok(updated)
@@ -1102,7 +1174,17 @@ where
                     }
                 } else {
                     // read from I/O stream and fill read buffer
-                    let should_disconnect = inner.as_mut().read_available(cx)?;
+                    let should_disconnect;
+                    #[cfg(feature = "backpressure_request")]
+                    {
+                        //dbg!(inner.opt_queued_chunk.is_none());
+                        should_disconnect = inner.as_mut().read_available(cx)?
+                            && inner.backpressure_items.opt_queued_chunk.is_none();
+                    }
+                    #[cfg(not(feature = "backpressure_request"))]
+                    {
+                        should_disconnect = inner.as_mut().read_available(cx)?;
+                    }
 
                     // after reading something from stream, clear keep-alive timer
                     if !inner.read_buf.is_empty() && inner.flags.contains(Flags::KEEP_ALIVE) {
